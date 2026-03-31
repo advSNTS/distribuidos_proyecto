@@ -1,0 +1,25 @@
+{
+  "name": "distribuidos_proyecto",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/advSNTS/distribuidos_proyecto.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/advSNTS/distribuidos_proyecto/issues"
+  },
+  "homepage": "https://github.com/advSNTS/distribuidos_proyecto#readme",
+  "dependencies": {
+    "express": "^5.2.1",
+    "zeromq": "^6.5.0"
+  }
+}
