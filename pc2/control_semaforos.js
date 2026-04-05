@@ -2,10 +2,13 @@
  * PC2 - Servicio de Control de Semáforos
  *
  * Responsabilidades:
- *  - Recibir comandos desde analitica.js (ZMQ PULL)
+ *  - Recibir comandos de estado desde analitica.js (ZMQ PULL)
  *  - Mantener el estado de la matriz de semáforos en memoria
- *  - Ejecutar cambios de luz (ROJO ↔ VERDE)
+ *  - Aplicar cambios de luz (ROJO ↔ VERDE) directamente sin timeouts propios
  *  - Persistir el estado de semáforos en replica_semaforos.json
+ *
+ * Nota: los ciclos y timers son gestionados por analitica.js.
+ *       Este servicio solo ejecuta los comandos que recibe.
  *
  * Run: node control_semaforos.js
  */
@@ -19,20 +22,12 @@ const CONFIG = {
   // ✅ No cambiar (comunicación interna dentro de PC2)
   PULL_ADDRESS: "tcp://127.0.0.1:5560",
 
-  // Matriz de la ciudad: filas=letras, columnas=números
-  // ⚠️ Cambiar ROWS y COLS si quieren una matriz distinta a 3x5
+  // Matriz de la ciudad
+  // ⚠️ Cambiar ROWS y COLS si cambian el tamaño de la matriz
+  // ⚠️ Debe coincidir exactamente con analitica.js
   MATRIX: {
-    ROWS: ["A", "B", "C"],       // 3 filas  → A, B, C
-    COLS: [1, 2, 3, 4, 5],       // 5 columnas → 1..5
-  },
-
-  // Tiempos de verde por condición (segundos)
-  // ⚠️ Ajustar si cambian las reglas en analitica.js
-  TIEMPOS: {
-    NORMAL:     15,
-    MODERADO:   20,
-    CONGESTION: 30,
-    PRIORIDAD:  60,
+    ROWS: ["A", "B", "C"],
+    COLS: [1, 2, 3, 4, 5],
   },
 
   // Archivo de réplica local de semáforos
@@ -44,14 +39,7 @@ const CONFIG = {
 
 /**
  * Genera el estado inicial de todos los semáforos de la matriz NxM.
- * Cada intersección arranca en ROJO con modo NORMAL.
- *
- * Estructura:
- * {
- *   "INT-A1": { estado: "ROJO", modo: "NORMAL", tiempo_verde: 15, ultimo_cambio: "..." },
- *   "INT-A2": { ... },
- *   ...
- * }
+ * Todos arrancan en ROJO — analítica iniciará los ciclos y mandará los primeros VERDE.
  */
 function inicializarMatriz() {
   const matriz = {};
@@ -60,8 +48,8 @@ function inicializarMatriz() {
       const id = `INT-${fila}${col}`;
       matriz[id] = {
         estado:        "ROJO",
-        modo:          "NORMAL",
-        tiempo_verde:  CONFIG.TIEMPOS.NORMAL,
+        condicion:     "NORMAL",
+        tiempo_verde:  15,
         ultimo_cambio: new Date().toISOString(),
       };
     }
@@ -75,76 +63,74 @@ console.log(`  Intersecciones: ${Object.keys(semaforos).join(", ")}\n`);
 
 // ─── RÉPLICA LOCAL ────────────────────────────────────────────────────────────
 
-/** Persiste el estado completo de la matriz en el archivo de réplica */
 function guardarReplica() {
-  const snapshot = {
-    timestamp: new Date().toISOString(),
-    semaforos,
-  };
-  fs.writeFileSync(CONFIG.REPLICA_FILE, JSON.stringify(snapshot, null, 2));
+  fs.writeFileSync(
+    CONFIG.REPLICA_FILE,
+    JSON.stringify({ timestamp: new Date().toISOString(), semaforos }, null, 2)
+  );
 }
 
-// Guardar estado inicial
-guardarReplica();
+guardarReplica(); // snapshot inicial
 
-// ─── LÓGICA DE SEMÁFOROS ──────────────────────────────────────────────────────
+// ─── APLICAR COMANDO ──────────────────────────────────────────────────────────
 
 /**
- * Aplica un comando de cambio de semáforo recibido desde analítica.
+ * Aplica un comando de estado recibido desde analítica.
  *
- * Comando esperado:
+ * Tipos aceptados:
+ *  - "SET_ESTADO": aplica directamente el estado indicado (VERDE o ROJO)
+ *  - "CAMBIO_SEMAFORO": compatibilidad con versiones anteriores (toggle)
+ *
+ * Campos del comando:
  * {
- *   tipo:        "CAMBIO_SEMAFORO",
+ *   tipo:         "SET_ESTADO",
  *   interseccion: "INT-C5",
- *   condicion:   "NORMAL" | "MODERADO" | "CONGESTION" | "PRIORIDAD",
- *   tiempo_verde: 15,
- *   timestamp:   "...",
- *   origen:      "SENSOR" | "USUARIO"  (opcional)
+ *   estado:       "VERDE" | "ROJO",
+ *   condicion:    "NORMAL" | "MODERADO" | "CONGESTION" | "PRIORIDAD",
+ *   tiempo_verde: 30,
+ *   timestamp:    "...",
+ *   origen:       "SENSOR" | "USUARIO" | "AUTO"  (opcional)
  * }
  */
 function aplicarComando(comando) {
-  const { interseccion, condicion, tiempo_verde, origen } = comando;
+  const { tipo, interseccion, estado, condicion, tiempo_verde, origen } = comando;
 
   if (!semaforos[interseccion]) {
     console.warn(`[Semáforos] ⚠️  Intersección desconocida: ${interseccion}`);
     return;
   }
 
-  const semaforo = semaforos[interseccion];
-  const estadoAnterior = semaforo.estado;
+  const sem          = semaforos[interseccion];
+  const estadoAntes  = sem.estado;
 
-  // Determinar nuevo estado según condición
-  // En PRIORIDAD y CONGESTION forzamos VERDE para dar paso
-  // En NORMAL/MODERADO hacemos toggle (simula el ciclo rojo↔verde)
+  // Determinar nuevo estado
   let nuevoEstado;
-  if (condicion === "PRIORIDAD" || condicion === "CONGESTION") {
-    nuevoEstado = "VERDE";
+  if (tipo === "SET_ESTADO") {
+    // Analítica dice exactamente qué estado poner
+    nuevoEstado = estado;
   } else {
-    nuevoEstado = semaforo.estado === "ROJO" ? "VERDE" : "ROJO";
+    // Compatibilidad: CONGESTION/PRIORIDAD fuerzan VERDE, resto hace toggle
+    if (condicion === "PRIORIDAD" || condicion === "CONGESTION") {
+      nuevoEstado = "VERDE";
+    } else {
+      nuevoEstado = sem.estado === "ROJO" ? "VERDE" : "ROJO";
+    }
   }
 
-  semaforo.estado        = nuevoEstado;
-  semaforo.modo          = condicion;
-  semaforo.tiempo_verde  = tiempo_verde ?? CONFIG.TIEMPOS[condicion] ?? 15;
-  semaforo.ultimo_cambio = new Date().toISOString();
+  sem.estado        = nuevoEstado;
+  sem.condicion     = condicion ?? sem.condicion;
+  sem.tiempo_verde  = tiempo_verde ?? sem.tiempo_verde;
+  sem.ultimo_cambio = new Date().toISOString();
 
-  // Log por pantalla
-  const origenTag = origen ? ` [origen: ${origen}]` : "";
-  const cambio    = `${estadoAnterior} → ${nuevoEstado}`;
-
-  console.log(`[Semáforos] ${interseccion} | ${cambio} | modo: ${condicion} | verde: ${semaforo.tiempo_verde}s${origenTag}`);
-
-  // Si pasó a VERDE, programar vuelta a ROJO automáticamente
-  if (nuevoEstado === "VERDE") {
-    setTimeout(() => {
-      semaforos[interseccion].estado        = "ROJO";
-      semaforos[interseccion].ultimo_cambio = new Date().toISOString();
-      console.log(`[Semáforos] ${interseccion} | VERDE → ROJO (tiempo cumplido: ${semaforo.tiempo_verde}s)`);
-      guardarReplica();
-    }, semaforo.tiempo_verde * 1000);
+  // Solo imprimir cuando hay cambio real de estado para no saturar la terminal
+  if (nuevoEstado !== estadoAntes) {
+    const origenTag = origen ? ` [${origen}]` : "";
+    console.log(
+      `[Semáforos] ${interseccion} | ${estadoAntes} → ${nuevoEstado}` +
+      ` | ${sem.condicion} | verde: ${sem.tiempo_verde}s${origenTag}`
+    );
+    guardarReplica();
   }
-
-  guardarReplica();
 }
 
 // ─── ZEROMQ SETUP ─────────────────────────────────────────────────────────────
@@ -156,14 +142,13 @@ console.log("[Semáforos] Servicio iniciado, esperando comandos...\n");
 // ─── LOOP PRINCIPAL ───────────────────────────────────────────────────────────
 for await (const [msgBuf] of pull) {
   let comando;
-  try {
-    comando = JSON.parse(msgBuf.toString());
-  } catch {
+  try { comando = JSON.parse(msgBuf.toString()); }
+  catch {
     console.error("[Semáforos] Comando JSON inválido recibido");
     continue;
   }
 
-  if (comando.tipo === "CAMBIO_SEMAFORO") {
+  if (comando.tipo === "SET_ESTADO" || comando.tipo === "CAMBIO_SEMAFORO") {
     aplicarComando(comando);
   } else {
     console.warn(`[Semáforos] Tipo de comando desconocido: ${comando.tipo}`);
