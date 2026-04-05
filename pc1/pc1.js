@@ -22,7 +22,7 @@ const CONFIG = {
 
   // PC2 connects its SUB socket to this address
   // Change 0.0.0.0 to this machine's actual IP when running on separate PCs
-  ZMQ_PUB_ADDRESS: "tcp://0.0.0.0:5555",
+  ZMQ_PUB_ADDRESS: "tcp://127.0.0.1:5555",
 };
 
 // ─── ZEROMQ SETUP ─────────────────────────────────────────────────────────────
